@@ -1,0 +1,451 @@
+from ultralytics import YOLO
+import cv2
+import threading
+import numpy as np
+import os
+from insightface.app import FaceAnalysis
+import time
+import mediapipe as mp
+import sys
+import subprocess
+
+# ========================== 1. Load YOLOv8-Pose ==========================
+model = YOLO("yolov8n-pose.pt")
+model.fuse()
+
+# ========================== 2. Load InsightFace ==========================
+face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+face_app.prepare(ctx_id=0, det_size=(480, 480))
+
+# ========================== 3. Preload known faces ==========================
+known_faces = []
+known_faces_folder = "known_faces"
+
+for person_name in os.listdir(known_faces_folder):
+    person_folder = os.path.join(known_faces_folder, person_name)
+    if not os.path.isdir(person_folder):
+        continue
+    embeddings = []
+    for filename in os.listdir(person_folder):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            img_path = os.path.join(person_folder, filename)
+            img = cv2.imread(img_path)
+            if img is None:
+                print(f"[WARN] Cannot read image: {img_path}")
+                continue
+            faces = face_app.get(img)
+            if len(faces) > 0:
+                embeddings.append(faces[0].embedding)
+    if len(embeddings) > 0:
+        avg_embedding = np.mean(embeddings, axis=0)
+        known_faces.append({"name": person_name, "embedding": avg_embedding})
+        print(f"Loaded {len(embeddings)} images for {person_name}")
+    else:
+        print(f"Không phát hiện mặt trong thư mục {person_name}")
+
+# ========================== 4. Helper functions ==========================
+def match_face(embedding, threshold=0.3):
+    best_name = "Unknown"
+    best_score = threshold
+    for entry in known_faces:
+        sim = np.dot(embedding, entry["embedding"]) / (np.linalg.norm(embedding) * np.linalg.norm(entry["embedding"]))
+        if sim > best_score:
+            best_score = sim
+            best_name = entry["name"]
+    return best_name
+
+def calculate_angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+    if angle > 180.0:
+        angle = 360.0 - angle
+    return angle
+
+# MediaPipe Hand
+os.environ["MEDIAPIPE_DISABLE_XNNPACK"] = "1"
+mp_hands = mp.solutions.hands
+mp_draw = mp.solutions.drawing_utils
+hands_detector = mp_hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.8, min_tracking_confidence=0.8)
+
+# ========================== 5. Camera ==========================
+cap = cv2.VideoCapture(0)
+cap.set(3, 1280)
+cap.set(4, 720)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+frame_latest = None
+lock_frame = threading.Lock()
+running = True
+
+def camera_thread():
+    global frame_latest, running
+    while running:
+        ret, img = cap.read()
+        if not ret:
+            continue
+        img = cv2.flip(img, 1)
+        with lock_frame:
+            frame_latest = img.copy()
+
+threading.Thread(target=camera_thread, daemon=True).start()
+
+# ========================== 6. Hand processing ==========================
+last_launched_cmd = ""      
+hold_start = None           
+hold_start_left = None      # GIỮ TAY TRÁI
+current_ros_cmd = None      # NGÓN TAY PHẢI ĐÃ MỞ FILE
+ros_process = None          # PROCESS ROS2 ĐANG CHẠY
+
+def process_hand(frame, x1, y1, x2, y2, annotated):
+    global last_launched_cmd, hold_start, hold_start_left
+    global current_ros_cmd, ros_process
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    hands_result = hands_detector.process(frame_rgb)
+    left_count, right_count = -1, -1
+    left_hand_cmd, right_hand_cmd = "", ""
+    hand_detected = False
+
+    # Map số ngón -> (ros_package, launch_file)
+    launch_map = {
+        0: ("my_bot", "ball_tracker.launch.py"),
+        1: ("my_bot", "follow_person.launch.py"),
+        2: ("my_bot", "virtual_steering.launch.py"),
+        3: ("my_bot", "go_wait_point.launch.py"),
+        4: ("my_bot", "return_start.launch.py"),
+        5: ("my_bot", "stop.launch.py"),
+    }
+
+    # ------------------ MỞ FILE ROS2 ------------------
+    def launch_ros(count):
+        global ros_process, current_ros_cmd
+
+        pkg, file = launch_map[count]
+        print("Launch:", pkg, file)
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+        ros_process = subprocess.Popen(["ros2", "launch", pkg, file])
+        current_ros_cmd = count
+
+        sys.exit(0)
+
+    # ------------------ TẮT FILE ROS2 ------------------
+    def stop_ros():
+        global ros_process, current_ros_cmd
+        if ros_process is not None:
+            ros_process.terminate()
+            ros_process = None
+            print(">>> ROS2 STOPPED.")
+
+        current_ros_cmd = None
+
+    # Tay trái giữ để tắt ROS
+    def wait_and_stop_left(count):
+        global hold_start_left, current_ros_cmd
+
+        if count != current_ros_cmd:
+            hold_start_left = None
+            return
+        
+        if hold_start_left is None:
+            hold_start_left = time.time()
+            return
+        
+        if time.time() - hold_start_left >= 5.0:
+            stop_ros()
+            hold_start_left = None
+
+    # ------------------ ĐỢI 5 GIÂY RỒI MỞ FILE ------------------
+    def wait_and_launch(count):
+        global hold_start, last_launched_cmd
+
+        if last_launched_cmd == f"finger_{count}":
+            return  
+
+        if hold_start is None:
+            hold_start = time.time()
+            return
+
+        if time.time() - hold_start >= 5.0:
+            last_launched_cmd = f"finger_{count}"
+            launch_ros(count)
+
+    # ========================== PROCESS HANDS ==========================
+    if hands_result.multi_hand_landmarks and hands_result.multi_handedness:
+        for hand_lms, handedness in zip(hands_result.multi_hand_landmarks, hands_result.multi_handedness):
+
+            cx = int(np.mean([lm.x for lm in hand_lms.landmark]) * frame.shape[1])
+            cy = int(np.mean([lm.y for lm in hand_lms.landmark]) * frame.shape[0])
+
+            if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+                continue
+
+            label = handedness.classification[0].label
+
+            h, w, _ = frame.shape
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms.landmark]
+
+            tip_ids = [4, 8, 12, 16, 20]
+            fingers = []
+
+            if label == "Left":
+                fingers.append(1 if pts[4][0] > pts[3][0] else 0)
+            else:
+                fingers.append(1 if pts[4][0] < pts[3][0] else 0)
+
+            for tid in tip_ids[1:]:
+                fingers.append(1 if pts[tid][1] < pts[tid - 2][1] else 0)
+
+            count = fingers.count(1)
+
+            cmds = [
+                "Follow object",
+                "Follow person",
+                "Control by virtual steering",
+                "Go to wait point",
+                "Return to the start point",
+                "Stop",
+            ]
+
+            if label == "Left":
+                left_count = count
+                left_hand_cmd = cmds[count]
+
+                # =========== TẮT FILE ROS ===========
+                wait_and_stop_left(count)
+
+            else:
+                right_count = count
+                right_hand_cmd = cmds[count]
+
+                # =========== MỞ FILE ROS ===========
+                wait_and_launch(count)
+
+            mp_draw.draw_landmarks(annotated, hand_lms, mp_hands.HAND_CONNECTIONS)
+            hand_detected = True
+
+    else:
+        hold_start = None
+        hold_start_left = None
+
+    return hand_detected, left_hand_cmd, right_hand_cmd, left_count, right_count
+
+# ========================== 7. Arm command processing ==========================
+def get_arm_cmd(keypoints):
+    class TmpLandmark:
+        x = 0
+        y = 0
+    landmarks = {j: TmpLandmark() for j in range(len(keypoints))}
+    for j, kp in enumerate(keypoints):
+        landmarks[j].x = float(kp[0])
+        landmarks[j].y = float(kp[1])
+
+    r_sh_angle = calculate_angle([landmarks[12].x, landmarks[12].y], [landmarks[6].x, landmarks[6].y], [landmarks[8].x, landmarks[8].y])
+    r_el_angle = calculate_angle([landmarks[6].x, landmarks[6].y], [landmarks[8].x, landmarks[8].y], [landmarks[10].x, landmarks[10].y])
+    l_sh_angle = calculate_angle([landmarks[11].x, landmarks[11].y], [landmarks[5].x, landmarks[5].y], [landmarks[7].x, landmarks[7].y])
+    l_el_angle = calculate_angle([landmarks[5].x, landmarks[5].y], [landmarks[7].x, landmarks[7].y], [landmarks[9].x, landmarks[9].y])
+
+    l_arm_cmd = ''
+    r_arm_cmd = ''
+
+    if 150 <= r_sh_angle <= 180 and 150 <= r_el_angle <= 180:
+        r_arm_cmd = "STOP"
+    elif 70 <= r_sh_angle <= 110 and 150 <= r_el_angle <= 180:
+        r_arm_cmd = "RUN"
+
+    if 150 <= l_sh_angle <= 180 and 150 <= l_el_angle <= 180:
+        l_arm_cmd = "STOP"
+    elif 70 <= l_sh_angle <= 110 and 150 <= l_el_angle <= 180:
+        l_arm_cmd = "RUN"
+
+    return l_arm_cmd, r_arm_cmd, (l_sh_angle, l_el_angle, r_sh_angle, r_el_angle)
+
+# ========================== 8. Processing thread (main) ==========================
+chosen_idx_last = None
+chosen_hold_frames = 3
+frames_no_face = 0
+
+def processing_thread():
+    global frame_latest, running, chosen_idx_last, frames_no_face
+    final_cmd = ""
+    current_detected_cmd = ""
+    final_cmd_timer = None
+    confirm_duration = 5.0
+
+    while running:
+        try:
+            if frame_latest is None:
+                time.sleep(0.005)
+                continue
+
+            with lock_frame:
+                frame = frame_latest.copy()
+
+            annotated = frame.copy()
+            h_img, w_img = frame.shape[:2]
+
+            results = model.predict(frame, imgsz=480, conf=0.5, iou=0.5, verbose=False, half=False, agnostic_nms=True)
+            pose_bboxes = []
+            keypoints_all = None
+
+            for r in results:
+                annotated = r.plot(labels=False)
+                if r.boxes is None or len(r.boxes.xyxy) == 0:
+                    continue
+                pose_bboxes = [list(map(int, box.cpu().numpy())) for box in r.boxes.xyxy]
+                keypoints_all = r.keypoints.xy
+
+            if len(pose_bboxes) == 0:
+                cv2.imshow("Robot mapping", annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    running = False
+                continue
+
+            face_names_all = []
+            face_areas_all = []
+
+            for i, (x1, y1, x2, y2) in enumerate(pose_bboxes):
+                x1c = max(0, min(w_img-1, x1))
+                y1c = max(0, min(h_img-1, y1))
+                x2c = max(0, min(w_img-1, x2))
+                y2c = max(0, min(h_img-1, y2))
+
+                if x2c <= x1c or y2c <= y1c:
+                    face_names_all.append("Unknown")
+                    face_areas_all.append(0)
+                    continue
+
+                person_crop = frame[y1c:y2c, x1c:x2c]
+
+                # Safe face detection
+                try:
+                    faces = face_app.get(person_crop)
+                except Exception as e:
+                    print("[WARN] face_app.get error:", e)
+                    faces = []
+
+                if len(faces) > 0:
+                    face = faces[0]
+                    emb = face.embedding
+                    name = match_face(emb)
+                    fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                    fx1 = np.clip(fx1, 0, person_crop.shape[1]-1)
+                    fy1 = np.clip(fy1, 0, person_crop.shape[0]-1)
+                    fx2 = np.clip(fx2, 0, person_crop.shape[1]-1)
+                    fy2 = np.clip(fy2, 0, person_crop.shape[0]-1)
+                    face_area = max(0, (fx2 - fx1) * (fy2 - fy1))
+                else:
+                    name = "Unknown"
+                    face_area = 0
+
+                face_names_all.append(name)
+                face_areas_all.append(face_area)
+                cv2.putText(annotated, name, (x1c, max(0, y1c-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0,255,0) if name!="Unknown" else (0,128,255), 2)
+
+            # Choose nearest known person by largest face area
+            chosen_idx = None
+            max_face_area = 0
+            for i, name in enumerate(face_names_all):
+                if name != "Unknown" and face_areas_all[i] > max_face_area:
+                    chosen_idx = i
+                    max_face_area = face_areas_all[i]
+
+            # SAFE-DETECT: giữ người đã chọn trong vài frame nếu mất mặt
+            if chosen_idx is None:
+                if chosen_idx_last is not None:
+                    frames_no_face += 1
+                    if frames_no_face <= chosen_hold_frames:
+                        chosen_idx = chosen_idx_last
+                    else:
+                        chosen_idx_last = None
+            else:
+                frames_no_face = 0
+
+            if chosen_idx is not None:
+                chosen_idx_last = chosen_idx
+
+            # Safe keypoints access
+            if keypoints_all is None or chosen_idx is None or chosen_idx >= len(keypoints_all):
+                person_kps = np.zeros((17, 2))  # Default keypoints, x,y = 0
+            else:
+                person_kps = keypoints_all[chosen_idx]
+
+            # Process hands
+            if chosen_idx is not None:
+                x1, y1, x2, y2 = pose_bboxes[chosen_idx]
+                x1 = max(0, min(w_img-1, int(x1)))
+                y1 = max(0, min(h_img-1, int(y1)))
+                x2 = max(0, min(w_img-1, int(x2)))
+                y2 = max(0, min(h_img-1, int(y2)))
+
+                hand_detected, left_hand_cmd, right_hand_cmd, left_count, right_count = process_hand(frame, x1, y1, x2, y2, annotated)
+
+                l_arm_cmd, r_arm_cmd, angles = get_arm_cmd(person_kps)
+                hand_cmd = left_hand_cmd if left_hand_cmd != "" else right_hand_cmd
+                arm_cmd = r_arm_cmd if r_arm_cmd != "" else l_arm_cmd
+                new_detected_cmd = hand_cmd if hand_detected else arm_cmd
+
+                if new_detected_cmd != current_detected_cmd:
+                    current_detected_cmd = new_detected_cmd
+                    final_cmd_timer = time.time() if new_detected_cmd != "" else None
+
+                if final_cmd_timer is not None:
+                    elapsed = time.time() - final_cmd_timer
+                    if elapsed >= confirm_duration:
+                        final_cmd = current_detected_cmd
+                else:
+                    elapsed = 0
+
+                y_offset = 25
+                if left_count != -1:
+                    cv2.putText(annotated, f"L Hand: {left_count} Stop {left_hand_cmd}", (x1+5, y1+y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    y_offset += 25
+                if right_count != -1:
+                    cv2.putText(annotated, f"R Hand: {right_count} {right_hand_cmd}", (x1+5, y1+y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    y_offset += 25
+                if l_arm_cmd != "":
+                    cv2.putText(annotated, f"R Arm: {l_arm_cmd}", (x1+5, y1+y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    y_offset += 25
+                if r_arm_cmd != "":
+                    cv2.putText(annotated, f"L Arm: {r_arm_cmd}", (x1+5, y1+y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    y_offset += 25
+
+                cv2.putText(annotated, f"FINAL CMD: {final_cmd}", (50,50), cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+                if final_cmd_timer is not None and new_detected_cmd != "":
+                    remaining = max(0, confirm_duration - elapsed)
+                    cv2.putText(annotated, f"Confirming: {remaining:.1f}s", (50,90), cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,255),2)
+            else:
+                cv2.putText(annotated, f"FINAL CMD: {final_cmd}", (50,50), cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+
+            cv2.imshow("YOLO Pose + Face + Angles + Hand", annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                running = False
+                cv2.destroyAllWindows()
+                break
+
+        except Exception as e:
+            print("[ERROR] processing_thread exception:", e)
+            time.sleep(0.05)
+
+
+threading.Thread(target=processing_thread, daemon=True).start()
+
+# ========================== 9. Keep main alive / cleanup ==========================
+try:
+    while running:
+        time.sleep(0.1)
+except KeyboardInterrupt:
+    running = False
+finally:
+    running = False
+    time.sleep(0.2)
+    try:
+        if cap.isOpened():
+            cap.release()
+    except Exception as e:
+        print("cap.release() error:", e)
+    cv2.destroyAllWindows()
