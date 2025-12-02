@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from ament_index_python.packages import get_package_share_directory
+from ultralytics import YOLO
+import cv2
+import threading
+import numpy as np
+import os
+from insightface.app import FaceAnalysis
+import time
+import mediapipe as mp
+import sys
+import subprocess
+import psutil
+
+class VisionMasterNode(Node):
+    def __init__(self):
+        super().__init__('vision_master_node')
+        self.get_logger().info("Main Vision Master Node Starting...")
+
+        # ================== 1. TỰ ĐỘNG TÌM ĐƯỜNG DẪN DATA ==================
+        try:
+            pkg_share = get_package_share_directory('main_vision')
+            self.data_dir = os.path.join(pkg_share, 'data') # Thư mục data chứa model
+        except Exception as e:
+            self.get_logger().error(f"Cannot find package 'main_vision': {e}")
+            sys.exit(1)
+
+        self.model_path = os.path.join(self.data_dir, "yolov8n-pose.pt")
+        self.faces_dir = os.path.join(self.data_dir, "known_faces")
+        self.insightface_model_dir = os.path.join(self.data_dir, "models") # Thư mục chứa buffalo_l
+
+        if not os.path.exists(self.model_path):
+            self.get_logger().warn(f"⚠️ Model not found at {self.model_path}. Downloading...")
+            # YOLO sẽ tự tải nếu không thấy, nhưng tốt nhất nên copy vào data
+        
+        # ================== 2. LOAD AI MODELS ==================
+        self.get_logger().info("Loading YOLOv8 Pose...")
+        self.yolo_model = YOLO(self.model_path)
+        
+        self.get_logger().info("Loading InsightFace...")
+        # providers=['CUDAExecutionProvider'] nếu có GPU, không thì CPU
+        try:
+            self.face_app = FaceAnalysis(name='buffalo_l', root=self.data_dir, providers=['CUDAExecutionProvider'])
+            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+        except Exception as e:
+            # fallback to CPU
+            self.get_logger().warn(f"CUDA provider failed, falling back to CPU: {e}")
+            self.face_app = FaceAnalysis(name='buffalo_l', root=self.data_dir, providers=['CPUExecutionProvider'])
+            self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+        # Load Known Faces (kept from original)
+        self.known_faces = self.load_known_faces()
+
+        # ================== 2b. Additional face-recog state (from your second script) ==================
+        # cache chosen person across few frames if face briefly lost
+        self.chosen_idx_last = None
+        self.chosen_hold_frames = 3
+        self.frames_no_face = 0
+        self.current_recognized_name = "Unknown"
+
+        # Load MediaPipe
+        self.mp_hands = mp.solutions.hands
+        self.mp_draw = mp.solutions.drawing_utils
+        self.hands_detector = self.mp_hands.Hands(
+            static_image_mode=False, 
+            max_num_hands=1, 
+            min_detection_confidence=0.7, 
+            min_tracking_confidence=0.5
+        )
+
+        # ================== 3. SYSTEM STATE ==================
+        self.running = True
+        self.frame_latest = None
+        self.lock_frame = threading.Lock()
+        
+        self.ros_process = None
+        self.current_ros_cmd = None
+        self.last_launched_cmd = ""
+        self.hold_start = None
+        self.hold_start_left = None
+        self.confirm_duration = 5.0 # Giữ tay 5s để kích hoạt
+
+        # Cấu hình Launch Map (Sửa lại tên Package cho đúng với workspace của bạn)
+        self.launch_map = {
+            # Ngón tay -> (Package Name, Launch File)
+            0: ("my_bot", "ball_tracker.launch.py"),
+            1: ("human_tracker", "human_tracker.launch.py"), # Sửa my_bot -> human_tracker
+            2: ("virtual_steering", "virtual_steering.launch.py"), # Sửa my_bot -> visual_steering
+            # Các chức năng chưa làm -> Trỏ tạm vào file nào đó hoặc để None
+            3: (None, "go_wait_point (Not Implemented)"), 
+            4: (None, "return_start (Not Implemented)"),
+            5: (None, "stop_robot (Not Implemented)"),
+        }
+
+        # ================== 4. CAMERA THREAD ==================
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        self.camera_thread = threading.Thread(target=self.read_camera, daemon=True)
+        self.camera_thread.start()
+
+        self.get_logger().info("✅ Vision Master Ready! Press 'Q' on window to exit.")
+        self.main_loop()
+
+    def load_known_faces(self):
+        faces_db = []
+        if not os.path.exists(self.faces_dir):
+            self.get_logger().warn(f"Folder {self.faces_dir} not found!")
+            return faces_db
+
+        for person_name in os.listdir(self.faces_dir):
+            person_folder = os.path.join(self.faces_dir, person_name)
+            if not os.path.isdir(person_folder): continue
+            
+            embeddings = []
+            for f in os.listdir(person_folder):
+                if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    img = cv2.imread(os.path.join(person_folder, f))
+                    if img is None: continue
+                    res = self.face_app.get(img)
+                    if res: embeddings.append(res[0].embedding)
+            
+            if embeddings:
+                avg_emb = np.mean(embeddings, axis=0)
+                faces_db.append({"name": person_name, "embedding": avg_emb})
+                self.get_logger().info(f"Loaded user: {person_name}")
+        return faces_db
+
+    def read_camera(self):
+        while self.running:
+            ret, img = self.cap.read()
+            if ret:
+                img = cv2.flip(img, 1)
+                with self.lock_frame:
+                    self.frame_latest = img.copy()
+            time.sleep(0.01)
+
+    # --- HÀM PHỤ TRỢ ---
+    def match_face(self, embedding, threshold=0.4):
+        best_name = "Unknown"
+        best_score = threshold
+        for entry in self.known_faces:
+            sim = np.dot(embedding, entry["embedding"]) / (np.linalg.norm(embedding) * np.linalg.norm(entry["embedding"]))
+            if sim > best_score:
+                best_score = sim
+                best_name = entry["name"]
+        return best_name
+
+    def launch_ros_node(self, count):
+        pkg, file = self.launch_map.get(count, (None, None))
+        
+        if pkg is None:
+            self.get_logger().warn(f"Command {count} is not implemented yet!")
+            return
+
+        # Explicitly stop any running node first
+        if self.ros_process is not None:
+             self.stop_ros_node()
+             time.sleep(1.0) # Give ROS 2 a second to clean up ports/topics
+
+        self.get_logger().info(f"🚀 Launching: {pkg}/{file}")
+        
+        # Launch new process
+        cmd = ["ros2", "launch", pkg, file]
+        self.ros_process = subprocess.Popen(cmd)
+        self.current_ros_cmd = count
+
+    def stop_ros_node(self):
+        if self.ros_process:
+            self.get_logger().info("🛑 Stopping current ROS2 node tree...")
+            
+            # Kill the process and all its children (essential for ros2 launch)
+            try:
+                parent = psutil.Process(self.ros_process.pid)
+                for child in parent.children(recursive=True):
+                    child.terminate()
+                parent.terminate()
+                
+                # Wait for actual termination
+                gone, alive = psutil.wait_procs(parent.children(recursive=True) + [parent], timeout=3)
+                for p in alive:
+                    p.kill() # Force kill if still alive
+            except psutil.NoSuchProcess:
+                pass # Process already dead
+
+            self.ros_process = None
+        
+        self.current_ros_cmd = None
+        self.last_launched_cmd = "" # Reset this so we can launch the same command again if needed
+
+    # --- LOGIC XỬ LÝ TAY ---
+    def process_hand_logic(self, frame, hands_res, authorized=True):
+        """
+        Nếu authorized == False thì reset hold timers và KHÔNG cho phép launch/stop.
+        """
+        left_cmd = ""
+        right_cmd = ""
+        
+        if not hands_res.multi_hand_landmarks:
+            self.hold_start = None
+            self.hold_start_left = None
+            return frame, "", ""
+
+        for hand_lms, handedness in zip(hands_res.multi_hand_landmarks, hands_res.multi_handedness):
+            label = handedness.classification[0].label # "Left" or "Right"
+            
+            # Đếm ngón tay
+            fingers = []
+            # Logic đếm ngón (giữ nguyên code của bạn)
+            h, w, _ = frame.shape
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms.landmark]
+            
+            # Ngón cái (ngang)
+            if label == "Left":
+                fingers.append(1 if pts[4][0] > pts[3][0] else 0)
+            else:
+                fingers.append(1 if pts[4][0] < pts[3][0] else 0)
+            
+            # 4 ngón còn lại (dọc)
+            for tid in [8, 12, 16, 20]:
+                fingers.append(1 if pts[tid][1] < pts[tid - 2][1] else 0)
+            
+            count = fingers.count(1)
+            
+            # --- LOGIC ĐIỀU KHIỂN ---
+            if label == "Right": # TAY PHẢI: CHỌN MODE
+                right_cmd = f"Mode {count}"
+                
+                # Check Debounce (Giữ 5 giây)
+                if not authorized:
+                    # reset timers so unknown cannot accumulate hold
+                    self.hold_start = None
+                else:
+                    if self.last_launched_cmd != f"cmd_{count}":
+                        if self.hold_start is None:
+                            self.hold_start = time.time()
+                        elif time.time() - self.hold_start >= self.confirm_duration:
+                            # Kích hoạt!
+                            self.last_launched_cmd = f"cmd_{count}"
+                            self.launch_ros_node(count)
+                    else:
+                        self.hold_start = None # Reset nếu đã kích hoạt xong
+
+            elif label == "Left": # TAY TRÁI: DỪNG (STOP)
+                left_cmd = f"Stop Check {count}"
+                # Nếu giơ đúng số ngón tay đang chạy -> Tắt
+                if not authorized:
+                    self.hold_start_left = None
+                else:
+                    if count == self.current_ros_cmd:
+                        if self.hold_start_left is None:
+                            self.hold_start_left = time.time()
+                        elif time.time() - self.hold_start_left >= self.confirm_duration:
+                            self.stop_ros_node()
+                            self.hold_start_left = None
+                    else:
+                        self.hold_start_left = None
+
+            self.mp_draw.draw_landmarks(frame, hand_lms, self.mp_hands.HAND_CONNECTIONS)
+
+        return frame, left_cmd, right_cmd
+
+    # --- VÒNG LẶP CHÍNH ---
+    def main_loop(self):
+        while rclpy.ok() and self.running:
+            if self.frame_latest is None:
+                time.sleep(0.01)
+                continue
+
+            with self.lock_frame:
+                frame = self.frame_latest.copy()
+
+            annotated = frame.copy()
+            h_img, w_img = frame.shape[:2]
+
+            # 1. Chạy YOLO Pose (Detect người)
+            results = self.yolo_model.predict(frame, imgsz=480, conf=0.5, verbose=False, agnostic_nms=True, device=0)
+            
+            pose_bboxes = []
+            keypoints_all = None
+            for r in results:
+                annotated = r.plot(labels=False)
+                # collect pose boxes & keypoints if available
+                try:
+                    if r.boxes is not None and len(r.boxes.xyxy) > 0:
+                        pose_bboxes = [list(map(int, box.cpu().numpy())) for box in r.boxes.xyxy]
+                    if hasattr(r, "keypoints") and r.keypoints is not None:
+                        keypoints_all = r.keypoints.xy
+                except Exception:
+                    # ignore occasional shape issues
+                    pass
+
+            # If no person detected, show frame and continue
+            if len(pose_bboxes) == 0:
+                # show current recognized name (keep previous)
+                cv2.putText(annotated, f"User: {self.current_recognized_name}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                cv2.putText(annotated, f"R Hand: ", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(annotated, f"L Hand: ", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.imshow("Main Vision Master", annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    self.running = False
+                    break
+                continue
+
+            # ------------------ FACE RECOGNITION per-person (from your second script) ------------------
+            face_names_all = []
+            face_areas_all = []
+
+            for i, (x1, y1, x2, y2) in enumerate(pose_bboxes):
+                x1c = max(0, min(w_img-1, x1))
+                y1c = max(0, min(h_img-1, y1))
+                x2c = max(0, min(w_img-1, x2))
+                y2c = max(0, min(h_img-1, y2))
+
+                if x2c <= x1c or y2c <= y1c:
+                    face_names_all.append("Unknown")
+                    face_areas_all.append(0)
+                    continue
+
+                person_crop = frame[y1c:y2c, x1c:x2c]
+
+                # Safe face detection
+                try:
+                    faces = self.face_app.get(person_crop)
+                except Exception as e:
+                    self.get_logger().warn(f"face_app.get error: {e}")
+                    faces = []
+
+                if len(faces) > 0:
+                    face = faces[0]
+                    emb = face.embedding
+                    name = self.match_face(emb, threshold=0.3)  # dùng threshold giống script thứ hai
+                    # compute face bbox area (in crop coords)
+                    try:
+                        fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                        fx1 = np.clip(fx1, 0, person_crop.shape[1]-1)
+                        fy1 = np.clip(fy1, 0, person_crop.shape[0]-1)
+                        fx2 = np.clip(fx2, 0, person_crop.shape[1]-1)
+                        fy2 = np.clip(fy2, 0, person_crop.shape[0]-1)
+                        face_area = max(0, (fx2 - fx1) * (fy2 - fy1))
+                    except Exception:
+                        face_area = 0
+                else:
+                    name = "Unknown"
+                    face_area = 0
+
+                face_names_all.append(name)
+                face_areas_all.append(face_area)
+                cv2.putText(annotated, name, (x1c, max(0, y1c-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0,255,0) if name!="Unknown" else (0,128,255), 2)
+
+            # Choose nearest known person by largest face area
+            chosen_idx = None
+            max_face_area = 0
+            for i, name in enumerate(face_names_all):
+                if name != "Unknown" and face_areas_all[i] > max_face_area:
+                    chosen_idx = i
+                    max_face_area = face_areas_all[i]
+
+            # SAFE-DETECT: giữ người đã chọn trong vài frame nếu mất mặt
+            if chosen_idx is None:
+                if self.chosen_idx_last is not None:
+                    self.frames_no_face += 1
+                    if self.frames_no_face <= self.chosen_hold_frames:
+                        chosen_idx = self.chosen_idx_last
+                    else:
+                        self.chosen_idx_last = None
+                else:
+                    # no previous
+                    pass
+            else:
+                self.frames_no_face = 0
+
+            if chosen_idx is not None:
+                self.chosen_idx_last = chosen_idx
+                recognized_name = face_names_all[chosen_idx]
+            else:
+                recognized_name = "Unknown"
+
+            # update current recognized name for display / authorization
+            self.current_recognized_name = recognized_name
+
+            # ------------------ HAND TRACKING & LOGIC ------------------
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            hands_res = self.hands_detector.process(frame_rgb)
+
+            # choose authorized: only allow commands if recognized_name != "Unknown"
+            authorized = (recognized_name != "Unknown")
+
+            # if we determined a chosen person, restrict hand region to that bbox (like second script)
+            if chosen_idx is not None:
+                x1, y1, x2, y2 = pose_bboxes[chosen_idx]
+                x1 = max(0, min(w_img-1, int(x1)))
+                y1 = max(0, min(h_img-1, int(y1)))
+                x2 = max(0, min(w_img-1, int(x2)))
+                y2 = max(0, min(h_img-1, int(y2)))
+                # Process hand logic (authorized will control actual launch/stop)
+                annotated, l_cmd, r_cmd = self.process_hand_logic(annotated, hands_res, authorized=authorized)
+            else:
+                # no chosen person, still process hands but explicitly disallow actions
+                annotated, l_cmd, r_cmd = self.process_hand_logic(annotated, hands_res, authorized=False)
+
+            # 3. Hiển thị thông tin
+            cv2.putText(annotated, f"User: {self.current_recognized_name}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            cv2.putText(annotated, f"R Hand: {r_cmd}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(annotated, f"L Hand: {l_cmd}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Hiển thị thời gian đếm ngược (nếu đang giữ tay)
+            if self.hold_start and authorized:
+                remain = max(0, self.confirm_duration - (time.time() - self.hold_start))
+                cv2.putText(annotated, f"Launching in: {remain:.1f}s", (10, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+            if self.hold_start_left and authorized:
+                remain = max(0, self.confirm_duration - (time.time() - self.hold_start_left))
+                cv2.putText(annotated, f"Stopping in: {remain:.1f}s", (10, 440), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+            if not authorized:
+                cv2.putText(annotated, "Commands: DISABLED (Unknown user)", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+            else:
+                cv2.putText(annotated, f"Commands: ENABLED ({self.current_recognized_name})", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+            cv2.imshow("Main Vision Master", annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.running = False
+                break
+
+        self.cleanup()
+
+    def cleanup(self):
+        self.stop_ros_node()
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+        cv2.destroyAllWindows()
+        self.destroy_node()
+        rclpy.shutdown()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VisionMasterNode()
+    # Node chạy main_loop trong __init__ nên không cần spin ở đây
+    # hoặc thiết kế lại để dùng timer
+
+if __name__ == '__main__':
+    main()
