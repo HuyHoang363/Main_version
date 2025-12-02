@@ -1,0 +1,234 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+import math
+import time
+import subprocess
+import sys
+import os
+
+# ================== CAMERA ==================
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+if not cap.isOpened():
+    print("Không mở được camera")
+    exit()
+
+# ================== ROBOT PARAMS ==================
+wheel_base = 40
+speed_base = 1.0
+turn_gain = 0.03
+heading = 0.0
+pos_x, pos_y = 400, 300
+
+# ================== MAP ==================
+map_w, map_h = 800, 600
+car_length = 40
+
+# ================== MEDIAPIPE ==================
+mp_hands = mp.solutions.hands
+mp_draw = mp.solutions.drawing_utils
+hands_detector = mp_hands.Hands(max_num_hands=2,
+                                min_detection_confidence=0.6,
+                                min_tracking_confidence=0.6)
+
+# ================== DRIVE STATE ==================
+drive_enabled = False
+smoothed_angle = 0.0
+alpha = 0.25
+deadzone = 5
+v_r_smooth = 0.0
+v_l_smooth = 0.0
+vel_alpha = 0.25
+fist_hold_start = None
+required_hold_time = 1.0
+
+# ================== 2 FINGERS TIMER ==================
+two_fingers_start = None
+required_two_fingers_time = 2.0  # giây chờ 2s
+last_launched_cmd = ''
+
+# ================== HAND GESTURE ==================
+def is_fist(hand_landmarks):
+    tips = [8, 12, 16, 20]
+    bases = [5, 9, 13, 17]
+    count_fold = sum(hand_landmarks.landmark[t].y > hand_landmarks.landmark[b].y
+                     for t, b in zip(tips, bases))
+    return count_fold >= 3
+
+def is_two_fingers(hand_landmarks):
+    tips = [8, 12]
+    bases = [5, 9]
+    up = sum(hand_landmarks.landmark[t].y < hand_landmarks.landmark[b].y
+             for t, b in zip(tips, bases))
+    folded = (hand_landmarks.landmark[16].y > hand_landmarks.landmark[13].y and
+              hand_landmarks.landmark[20].y > hand_landmarks.landmark[17].y)
+    return up == 2 and folded
+
+def switch_to(file_path):
+    abs_path = os.path.abspath(file_path)
+    print("Go to file:", abs_path)
+    cap.release()
+    cv2.destroyAllWindows()
+    subprocess.Popen([sys.executable, abs_path])
+    sys.exit(0)
+
+# ============================ START LOOP ============================
+radius = 150
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands_detector.process(frame_rgb)
+
+    wrist_left = wrist_right = None
+    left_land = right_land = None
+
+    if results.multi_hand_landmarks and results.multi_handedness:
+        for hand_landmarks, hand_info in zip(results.multi_hand_landmarks, results.multi_handedness):
+            hand_type = hand_info.classification[0].label
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            wrist = hand_landmarks.landmark[0]
+            wx = int(wrist.x * frame.shape[1])
+            wy = int(wrist.y * frame.shape[0])
+            if hand_type == "Left":
+                wrist_left = (wx, wy)
+                left_land = hand_landmarks
+            else:
+                wrist_right = (wx, wy)
+                right_land = hand_landmarks
+
+    hand_count = (1 if left_land else 0) + (1 if right_land else 0)
+    direction = "STOP"
+    moving = False
+
+    # ========== 2 TAY ==========
+    if hand_count == 2:
+        left_fist = is_fist(left_land)
+        right_fist = is_fist(right_land)
+        if not left_fist and not right_fist:
+            drive_enabled = False
+            fist_hold_start = None
+            direction = "STOP"
+        elif left_fist and right_fist:
+            if not drive_enabled:
+                if fist_hold_start is None:
+                    fist_hold_start = time.time()
+                elif time.time() - fist_hold_start >= required_hold_time:
+                    drive_enabled = True
+            direction = "Forward"
+        else:
+            drive_enabled = False
+            fist_hold_start = None
+            direction = "STOP"
+
+    # ========== 1 TAY ==========
+    elif hand_count == 1:
+        hand = left_land if left_land else right_land
+        if is_fist(hand):
+            direction = "Backward"
+            drive_enabled = True
+            fist_hold_start = None
+            two_fingers_start = None  # reset timer
+        elif is_two_fingers(hand):
+            if two_fingers_start is None:
+                two_fingers_start = time.time()
+            elif time.time() - two_fingers_start >= required_two_fingers_time:
+                if last_launched_cmd != "Control_hand_gesture.py":
+                    last_launched_cmd = "Control_hand_gesture.py"
+                    switch_to("Control_hand_gesture.py")
+            direction = "STOP"
+            drive_enabled = False
+        else:
+            direction = "STOP"
+            drive_enabled = False
+            fist_hold_start = None
+            two_fingers_start = None
+    else:
+        drive_enabled = False
+        fist_hold_start = None
+        two_fingers_start = None
+        direction = "STOP"
+
+    moving = (drive_enabled and direction != "STOP")
+
+    # ========== STEERING ==========
+    angle = 0
+    cx = cy = None
+    if wrist_left and wrist_right:
+        xL, yL = wrist_left
+        xR, yR = wrist_right
+        cx = (xL + xR) // 2
+        cy = (yL + yR) // 2
+        dx = xR - xL
+        dy = yR - yL
+        raw_angle = np.clip(np.degrees(np.arctan2(dy, dx)), -90, 90)
+        smoothed_angle = alpha * raw_angle + (1 - alpha) * smoothed_angle
+        angle = 0 if abs(smoothed_angle) < deadzone else smoothed_angle
+
+    # ========== DIFFERENTIAL DRIVE ==========
+    if moving:
+        if direction == "Forward":
+            turn_rate = angle * turn_gain
+            v_r = speed_base + turn_rate
+            v_l = speed_base - turn_rate
+        elif direction == "Backward":
+            v_r = -speed_base
+            v_l = -speed_base
+        else:
+            v_r = v_l = 0
+
+        v_r_smooth = vel_alpha * v_r + (1 - vel_alpha) * v_r_smooth
+        v_l_smooth = vel_alpha * v_l + (1 - vel_alpha) * v_l_smooth
+        v = (v_r_smooth + v_l_smooth) / 2.0
+        omega = (v_r_smooth - v_l_smooth) / wheel_base
+        heading += omega
+        pos_x += v * math.cos(heading)
+        pos_y += v * math.sin(heading)
+        pos_x = np.clip(pos_x, 0, map_w)
+        pos_y = np.clip(pos_y, 0, map_h)
+
+    # ========== VÔ LĂNG ẢO ==========
+    if cx is not None:
+        cv2.circle(frame, (cx, cy), radius, (0, 255, 0), 3)
+        rad = np.deg2rad(smoothed_angle)
+        vx, vy = np.cos(rad), np.sin(rad)
+        start_point = (int(cx - vx * radius), int(cy - vy * radius))
+        end_point = (int(cx + vx * radius), int(cy + vy * radius))
+        cv2.line(frame, start_point, end_point, (255, 0, 0), 3, cv2.LINE_AA)
+        px, py = -vy, vx
+        perp_end = (int(cx + px * radius), int(cy + py * radius))
+        cv2.line(frame, (cx, cy), perp_end, (0, 255, 255), 3, cv2.LINE_AA)
+
+    # ========== MAP ==========
+    canvas = np.ones((map_h, map_w, 3), dtype=np.uint8) * 255
+    x_head = int(pos_x + (car_length//2) * math.cos(heading))
+    y_head = int(pos_y + (car_length//2) * math.sin(heading))
+    x_tail = int(pos_x - (car_length//2) * math.cos(heading))
+    y_tail = int(pos_y - (car_length//2) * math.sin(heading))
+    cv2.line(canvas, (x_tail, y_tail), (x_head, y_head), (0,0,255), 3)
+    arrow_size = 12
+    arrow_angle = math.pi / 6
+    left_wing = (int(x_head - arrow_size * math.cos(heading - arrow_angle)),
+                 int(y_head - arrow_size * math.sin(heading - arrow_angle)))
+    right_wing = (int(x_head - arrow_size * math.cos(heading + arrow_angle)),
+                  int(y_head - arrow_size * math.sin(heading + arrow_angle)))
+    cv2.line(canvas, (x_head, y_head), left_wing, (0,0,255), 2)
+    cv2.line(canvas, (x_head, y_head), right_wing, (0,0,255), 2)
+    cv2.putText(canvas,
+                f"Dir: {direction}  Angle: {int(angle)}  Heading: {int(np.degrees(heading))}  RUN={drive_enabled}",
+                (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+
+    cv2.imshow("Virtual steering", frame)
+    cv2.imshow("Map", canvas)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
