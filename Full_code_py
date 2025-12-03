@@ -1,0 +1,728 @@
+from ultralytics import YOLO
+import cv2
+import threading
+import numpy as np
+import os
+from insightface.app import FaceAnalysis
+import time
+import mediapipe as mp
+import sys
+import subprocess
+
+# ========================== 1. Load YOLOv8-Pose ==========================
+model = YOLO("yolov8n-pose.pt")
+model.fuse()
+
+# ========================== 2. Load InsightFace ==========================
+face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+face_app.prepare(ctx_id=0, det_size=(480, 480))
+
+# ========================== 3. Preload known faces ==========================
+known_faces = []
+known_faces_folder = "known_faces"
+
+for person_name in os.listdir(known_faces_folder):
+    person_folder = os.path.join(known_faces_folder, person_name)
+    if not os.path.isdir(person_folder):
+        continue
+    embeddings = []
+    for filename in os.listdir(person_folder):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            img_path = os.path.join(person_folder, filename)
+            img = cv2.imread(img_path)
+            if img is None:
+                print(f"[WARN] Cannot read image: {img_path}")
+                continue
+            faces = face_app.get(img)
+            if len(faces) > 0:
+                embeddings.append(faces[0].embedding)
+    if len(embeddings) > 0:
+        avg_embedding = np.mean(embeddings, axis=0)
+        known_faces.append({"name": person_name, "embedding": avg_embedding})
+        print(f"Loaded {len(embeddings)} images for {person_name}")
+    else:
+        print(f"Không phát hiện mặt trong thư mục {person_name}")
+
+# ========================== 4. Helper functions ==========================
+def match_face(embedding, threshold=0.3):
+    best_name = "Unknown"
+    best_score = threshold
+    for entry in known_faces:
+        sim = np.dot(embedding, entry["embedding"]) / (np.linalg.norm(embedding) * np.linalg.norm(entry["embedding"]))
+        if sim > best_score:
+            best_score = sim
+            best_name = entry["name"]
+    return best_name
+
+def calculate_angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+    if angle > 180.0:
+        angle = 360.0 - angle
+    return angle
+
+# MediaPipe Hand (main detector - single hand)
+os.environ["MEDIAPIPE_DISABLE_XNNPACK"] = "1"
+mp_hands = mp.solutions.hands
+mp_draw = mp.solutions.drawing_utils
+hands_detector = mp_hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.8, min_tracking_confidence=0.8)
+
+# ========================== 5. Camera ==========================
+cap = cv2.VideoCapture(0)
+cap.set(3, 1280)
+cap.set(4, 720)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+frame_latest = None
+lock_frame = threading.Lock()
+running = True
+
+def camera_thread():
+    global frame_latest, running
+    while running:
+        ret, img = cap.read()
+        if not ret:
+            continue
+        img = cv2.flip(img, 1)
+        with lock_frame:
+            frame_latest = img.copy()
+        # small sleep to reduce CPU
+        time.sleep(0.001)
+
+threading.Thread(target=camera_thread, daemon=True).start()
+
+# ========================== Global control flags ==========================
+last_launched_cmd = ""      # to avoid re-triggering
+hold_start = None           # for right-hand hold
+hold_start_left = None      # for left-hand hold to stop ROS (original)
+current_ros_cmd = None      # which ros cmd is running (if any)
+ros_process = None          # external ros process handle
+virtual_active = False      # when True -> virtual steering is running and main logic should be ignored
+
+# Map số ngón -> (ros_package, launch_file)
+launch_map = {
+    0: ("my_bot", "ball_tracker.launch.py"),
+    1: ("my_bot", "follow_person.launch.py"),
+    2: ("my_bot", "virtual_steering.launch.py"),  # replaced by integrated virtual steering
+    3: ("my_bot", "go_wait_point.launch.py"),
+    4: ("my_bot", "return_start.launch.py"),
+    5: ("my_bot", "stop.launch.py"),
+}
+
+# ============================ ROS helpers ============================
+def launch_ros(count):
+    """Original ROS launching for non-virtual-steering commands"""
+    global ros_process, current_ros_cmd
+    pkg, file = launch_map[count]
+    print("Launch:", pkg, file)
+
+    # release GUI windows / camera usage before launching external ros process.
+    cap.release()
+    cv2.destroyAllWindows()
+
+    ros_process = subprocess.Popen(["ros2", "launch", pkg, file])
+    current_ros_cmd = count
+
+    # original code used sys.exit after launching ROS
+    sys.exit(0)
+
+def stop_ros():
+    global ros_process, current_ros_cmd
+    if ros_process is not None:
+        ros_process.terminate()
+        ros_process = None
+        print(">>> ROS2 STOPPED.")
+    current_ros_cmd = None
+
+def wait_and_stop_left(count):
+    """Original: if left-hand holds for 5s while that ros cmd is active => stop it"""
+    global hold_start_left, current_ros_cmd
+    if count != current_ros_cmd:
+        hold_start_left = None
+        return
+    if hold_start_left is None:
+        hold_start_left = time.time()
+        return
+    if time.time() - hold_start_left >= 5.0:
+        stop_ros()
+        hold_start_left = None
+
+# ========================== Virtual steering (integrated) ==========================
+def run_virtual_steering():
+    """
+    Integrated Virtual Steering.
+    Uses the shared frame_latest (camera thread continues).
+    Exits when left hand = 2 fingers held for required duration.
+    When running, sets virtual_active True so main logic is paused.
+    """
+    global virtual_active, running
+
+    print("[virtual_steering] starting")
+    virtual_active = True
+
+    # separate MediaPipe hands detector tuned for up to 2 hands
+    vs_hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.6, min_tracking_confidence=0.6)
+
+    # virtual steering state
+    wheel_base = 40
+    speed_base = 1.0
+    turn_gain = 0.03
+    heading = 0.0
+    pos_x, pos_y = 400, 300
+    map_w, map_h = 800, 600
+    car_length = 40
+
+    drive_enabled = False
+    smoothed_angle = 0.0
+    alpha = 0.25
+    deadzone = 5
+    v_r_smooth = 0.0
+    v_l_smooth = 0.0
+    vel_alpha = 0.25
+    fist_hold_start = None
+    required_hold_time = 1.0
+
+    two_fingers_start = None
+    required_two_fingers_time = 5.0  # seconds to confirm left-hand 2-fingers -> exit
+
+    radius = 150
+
+    def is_fist(hand_landmarks):
+        tips = [8, 12, 16, 20]
+        bases = [5, 9, 13, 17]
+        count_fold = sum(hand_landmarks.landmark[t].y > hand_landmarks.landmark[b].y
+                         for t, b in zip(tips, bases))
+        return count_fold >= 3
+
+    def is_two_fingers(hand_landmarks):
+        tips = [8, 12]
+        bases = [5, 9]
+        up = sum(hand_landmarks.landmark[t].y < hand_landmarks.landmark[b].y
+                 for t, b in zip(tips, bases))
+        folded = (hand_landmarks.landmark[16].y > hand_landmarks.landmark[13].y and
+                  hand_landmarks.landmark[20].y > hand_landmarks.landmark[17].y)
+        return up == 2 and folded
+
+    try:
+        while running:
+            # get latest frame
+            with lock_frame:
+                if frame_latest is None:
+                    frame = None
+                else:
+                    frame = frame_latest.copy()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = vs_hands.process(frame_rgb)
+
+            wrist_left = wrist_right = None
+            left_land = right_land = None
+
+            if results.multi_hand_landmarks and results.multi_handedness:
+                for hand_landmarks, hand_info in zip(results.multi_hand_landmarks, results.multi_handedness):
+                    hand_type = hand_info.classification[0].label
+                    mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                    wrist = hand_landmarks.landmark[0]
+                    wx = int(wrist.x * frame.shape[1])
+                    wy = int(wrist.y * frame.shape[0])
+                    if hand_type == "Left":
+                        wrist_left = (wx, wy)
+                        left_land = hand_landmarks
+                    else:
+                        wrist_right = (wx, wy)
+                        right_land = hand_landmarks
+
+            hand_count = (1 if left_land else 0) + (1 if right_land else 0)
+            direction = "STOP"
+            moving = False
+
+            # two-hands behavior
+            if hand_count == 2:
+                left_fist = is_fist(left_land)
+                right_fist = is_fist(right_land)
+                if not left_fist and not right_fist:
+                    drive_enabled = False
+                    fist_hold_start = None
+                    direction = "STOP"
+                elif left_fist and right_fist:
+                    if not drive_enabled:
+                        if fist_hold_start is None:
+                            fist_hold_start = time.time()
+                        elif time.time() - fist_hold_start >= required_hold_time:
+                            drive_enabled = True
+                    direction = "Forward"
+                else:
+                    drive_enabled = False
+                    fist_hold_start = None
+                    direction = "STOP"
+
+            # one-hand behavior
+            elif hand_count == 1:
+                hand = left_land if left_land else right_land
+                if is_fist(hand):
+                    direction = "Backward"
+                    drive_enabled = True
+                    fist_hold_start = None
+                    two_fingers_start = None
+                else:
+                    # detect left-hand two-fingers to exit
+                    if left_land is not None and is_two_fingers(left_land):
+                        if two_fingers_start is None:
+                            two_fingers_start = time.time()
+                        elapsed = time.time() - two_fingers_start
+                        remaining = max(0, required_two_fingers_time - elapsed)
+                        # show countdown
+                        cv2.putText(frame, f"Exit in: {remaining:.1f}s", (50,50),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+                        if elapsed >= required_two_fingers_time:
+                            print("[virtual_steering] left-hand 2-fingers hold -> exit virtual steering")
+                            break
+                        direction = "STOP"
+                        drive_enabled = False
+                    else:
+                        direction = "STOP"
+                        drive_enabled = False
+                        fist_hold_start = None
+                        two_fingers_start = None
+            else:
+                drive_enabled = False
+                fist_hold_start = None
+                two_fingers_start = None
+                direction = "STOP"
+
+            moving = (drive_enabled and direction != "STOP")
+
+            # steering calculation
+            angle = 0
+            cx = cy = None
+            if wrist_left and wrist_right:
+                xL, yL = wrist_left
+                xR, yR = wrist_right
+                cx = (xL + xR) // 2
+                cy = (yL + yR) // 2
+                dx = xR - xL
+                dy = yR - yL
+                raw_angle = np.clip(np.degrees(np.arctan2(dy, dx)), -90, 90)
+                smoothed_angle = alpha * raw_angle + (1 - alpha) * smoothed_angle
+                angle = 0 if abs(smoothed_angle) < deadzone else smoothed_angle
+
+            # differential drive physics (simulation)
+            if moving:
+                if direction == "Forward":
+                    turn_rate = angle * turn_gain
+                    v_r = speed_base + turn_rate
+                    v_l = speed_base - turn_rate
+                elif direction == "Backward":
+                    v_r = -speed_base
+                    v_l = -speed_base
+                else:
+                    v_r = v_l = 0
+
+                v_r_smooth = vel_alpha * v_r + (1 - vel_alpha) * v_r_smooth
+                v_l_smooth = vel_alpha * v_l + (1 - vel_alpha) * v_l_smooth
+                v = (v_r_smooth + v_l_smooth) / 2.0
+                omega = (v_r_smooth - v_l_smooth) / wheel_base
+                heading += omega
+                pos_x += v * np.cos(heading)
+                pos_y += v * np.sin(heading)
+                pos_x = np.clip(pos_x, 0, map_w)
+                pos_y = np.clip(pos_y, 0, map_h)
+
+            # draw virtual steering UI and map
+            if cx is not None:
+                cv2.circle(frame, (cx, cy), radius, (0, 255, 0), 3)
+                rad = np.deg2rad(smoothed_angle)
+                vx, vy = np.cos(rad), np.sin(rad)
+                start_point = (int(cx - vx * radius), int(cy - vy * radius))
+                end_point = (int(cx + vx * radius), int(cy + vy * radius))
+                cv2.line(frame, start_point, end_point, (255, 0, 0), 3, cv2.LINE_AA)
+                px, py = -vy, vx
+                perp_end = (int(cx + px * radius), int(cy + py * radius))
+                cv2.line(frame, (cx, cy), perp_end, (0, 255, 255), 3, cv2.LINE_AA)
+
+            canvas = np.ones((map_h, map_w, 3), dtype=np.uint8) * 255
+            x_head = int(pos_x + (car_length//2) * np.cos(heading))
+            y_head = int(pos_y + (car_length//2) * np.sin(heading))
+            x_tail = int(pos_x - (car_length//2) * np.cos(heading))
+            y_tail = int(pos_y - (car_length//2) * np.sin(heading))
+            cv2.line(canvas, (x_tail, y_tail), (x_head, y_head), (0,0,255), 3)
+            arrow_size = 12
+            arrow_angle = np.pi / 6
+            left_wing = (int(x_head - arrow_size * np.cos(heading - arrow_angle)),
+                         int(y_head - arrow_size * np.sin(heading - arrow_angle)))
+            right_wing = (int(x_head - arrow_size * np.cos(heading + arrow_angle)),
+                          int(y_head - arrow_size * np.sin(heading + arrow_angle)))
+            cv2.line(canvas, (x_head, y_head), left_wing, (0,0,255), 2)
+            cv2.line(canvas, (x_head, y_head), right_wing, (0,0,255), 2)
+            cv2.putText(canvas,
+                        f"Dir: {direction}  Angle: {int(angle)}  Heading: {int(np.degrees(heading))}  RUN={drive_enabled}",
+                        (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+
+            cv2.imshow("Virtual steering", frame)
+            cv2.imshow("Map", canvas)
+
+            # pressing 'q' will also exit virtual steering
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("[virtual_steering] 'q' pressed -> exiting")
+                break
+
+            time.sleep(0.002)
+
+    except Exception as e:
+        print("[virtual_steering] exception:", e)
+    finally:
+        try:
+            cv2.destroyWindow("Virtual steering")
+            cv2.destroyWindow("Map")
+        except:
+            pass
+        virtual_active = False
+        print("[virtual_steering] exited -> returning to main")
+
+# ========================== 6b. process_hand (main hand logic) ==========================
+def process_hand(frame, x1, y1, x2, y2, annotated):
+    """
+    Main hand processing used in the main processing loop.
+    If right hand = 2 fingers and held 5s -> start integrated virtual steering (blocks until exit).
+    Left-hand hold still works to stop ROS (original behavior).
+    """
+    global last_launched_cmd, hold_start, hold_start_left, virtual_active
+    global current_ros_cmd, ros_process
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    hands_result = hands_detector.process(frame_rgb)
+    left_count, right_count = -1, -1
+    left_hand_cmd, right_hand_cmd = "", ""
+    hand_detected = False
+
+    # Map inside to keep parity with original (not redefined every call ideally, but kept)
+    launch_map_local = launch_map
+
+    # helpers
+    def launch_ros_local(count):
+        # call global launch_ros for non-virtual-steering
+        launch_ros(count)
+
+    def wait_and_stop_left_local(count):
+        wait_and_stop_left(count)
+
+    def wait_and_launch_local(count):
+        # This handles the 5s hold on right-hand for launching.
+        global hold_start, last_launched_cmd, virtual_active
+
+        # If already triggered, ignore
+        if last_launched_cmd == f"finger_{count}":
+            return
+
+        if hold_start is None:
+            hold_start = time.time()
+            return
+
+        if time.time() - hold_start >= 5.0:
+            last_launched_cmd = f"finger_{count}"
+            # If the command is virtual steering (count==2), run integrated virtual steering
+            if count == 2:
+                print(">>> right-hand 2-fingers held 5s: launching integrated Virtual Steering.")
+                # close main window
+                try:
+                    cv2.destroyWindow("Robot mapping")
+                except:
+                    pass
+                # reset hold_start so it doesn't interfere later
+                hold_start = None
+                # run virtual steering (this will set virtual_active True)
+                run_virtual_steering()  # blocking until virtual steering exits
+                # reset last_launched_cmd so user can re-enter later
+                last_launched_cmd = ""
+            else:
+                # keep original behavior for other counts
+                launch_ros_local(count)
+
+    # ========================== PROCESS HANDS ==========================
+    if hands_result.multi_hand_landmarks and hands_result.multi_handedness:
+        for hand_lms, handedness in zip(hands_result.multi_hand_landmarks, hands_result.multi_handedness):
+
+            cx = int(np.mean([lm.x for lm in hand_lms.landmark]) * frame.shape[1])
+            cy = int(np.mean([lm.y for lm in hand_lms.landmark]) * frame.shape[0])
+
+            # restrict to person bbox
+            if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+                continue
+
+            label = handedness.classification[0].label
+
+            h, w, _ = frame.shape
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms.landmark]
+
+            tip_ids = [4, 8, 12, 16, 20]
+            fingers = []
+
+            # thumb
+            if label == "Left":
+                fingers.append(1 if pts[4][0] > pts[3][0] else 0)
+            else:
+                fingers.append(1 if pts[4][0] < pts[3][0] else 0)
+
+            for tid in tip_ids[1:]:
+                fingers.append(1 if pts[tid][1] < pts[tid - 2][1] else 0)
+
+            count = fingers.count(1)
+
+            cmds = [
+                "Follow object",
+                "Follow person",
+                "Control by virtual steering",
+                "Go to wait point",
+                "Return to the start point",
+                "Stop",
+            ]
+
+            if label == "Left":
+                left_count = count
+                left_hand_cmd = cmds[count]
+
+                # left-hand hold still used to stop ROS
+                wait_and_stop_left_local(count)
+
+            else:
+                right_count = count
+                right_hand_cmd = cmds[count]
+
+                # right-hand: wait 5s then either launch ROS or virtual steering
+                wait_and_launch_local(count)
+
+            mp_draw.draw_landmarks(annotated, hand_lms, mp_hands.HAND_CONNECTIONS)
+            hand_detected = True
+
+    else:
+        # no hand: reset hold timers
+        hold_start = None
+        hold_start_left = None
+
+    return hand_detected, left_hand_cmd, right_hand_cmd, left_count, right_count
+
+# ========================== 7. Arm command processing ==========================
+def get_arm_cmd(keypoints):
+    class TmpLandmark:
+        x = 0
+        y = 0
+    landmarks = {j: TmpLandmark() for j in range(len(keypoints))}
+    for j, kp in enumerate(keypoints):
+        landmarks[j].x = float(kp[0])
+        landmarks[j].y = float(kp[1])
+
+    r_sh_angle = calculate_angle([landmarks[12].x, landmarks[12].y], [landmarks[6].x, landmarks[6].y], [landmarks[8].x, landmarks[8].y])
+    r_el_angle = calculate_angle([landmarks[6].x, landmarks[6].y], [landmarks[8].x, landmarks[8].y], [landmarks[10].x, landmarks[10].y])
+    l_sh_angle = calculate_angle([landmarks[11].x, landmarks[11].y], [landmarks[5].x, landmarks[5].y], [landmarks[7].x, landmarks[7].y])
+    l_el_angle = calculate_angle([landmarks[5].x, landmarks[5].y], [landmarks[7].x, landmarks[7].y], [landmarks[9].x, landmarks[9].y])
+
+    l_arm_cmd = ''
+    r_arm_cmd = ''
+
+    if 150 <= r_sh_angle <= 180 and 150 <= r_el_angle <= 180:
+        r_arm_cmd = "STOP"
+    elif 70 <= r_sh_angle <= 110 and 150 <= r_el_angle <= 180:
+        r_arm_cmd = "RUN"
+
+    if 150 <= l_sh_angle <= 180 and 150 <= l_el_angle <= 180:
+        l_arm_cmd = "STOP"
+    elif 70 <= l_sh_angle <= 110 and 150 <= l_el_angle <= 180:
+        l_arm_cmd = "RUN"
+
+    return l_arm_cmd, r_arm_cmd, (l_sh_angle, l_el_angle, r_sh_angle, r_el_angle)
+
+# ========================== 8. Processing thread (main) ==========================
+chosen_idx_last = None
+chosen_hold_frames = 3
+frames_no_face = 0
+
+def processing_thread():
+    global frame_latest, running, chosen_idx_last, frames_no_face, virtual_active
+    final_cmd = ""
+    current_detected_cmd = ""
+    final_cmd_timer = None
+    confirm_duration = 5.0
+
+    while running:
+        try:
+            # If virtual steering active, pause main logic (ignore all Code1 logic)
+            if virtual_active:
+                # allow camera thread to continue; just wait until virtual_active becomes False
+                time.sleep(0.02)
+                continue
+
+            if frame_latest is None:
+                time.sleep(0.005)
+                continue
+
+            with lock_frame:
+                frame = frame_latest.copy()
+
+            annotated = frame.copy()
+            h_img, w_img = frame.shape[:2]
+
+            results = model.predict(frame, imgsz=480, conf=0.5, iou=0.5, verbose=False, half=False, agnostic_nms=True)
+            pose_bboxes = []
+            keypoints_all = None
+
+            for r in results:
+                annotated = r.plot(labels=False)
+                if r.boxes is None or len(r.boxes.xyxy) == 0:
+                    continue
+                pose_bboxes = [list(map(int, box.cpu().numpy())) for box in r.boxes.xyxy]
+                keypoints_all = r.keypoints.xy
+
+            if len(pose_bboxes) == 0:
+                cv2.imshow("Robot mapping", annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    running = False
+                continue
+
+            face_names_all = []
+            face_areas_all = []
+
+            for i, (x1, y1, x2, y2) in enumerate(pose_bboxes):
+                x1c = max(0, min(w_img-1, x1))
+                y1c = max(0, min(h_img-1, y1))
+                x2c = max(0, min(w_img-1, x2))
+                y2c = max(0, min(h_img-1, y2))
+
+                if x2c <= x1c or y2c <= y1c:
+                    face_names_all.append("Unknown")
+                    face_areas_all.append(0)
+                    continue
+
+                person_crop = frame[y1c:y2c, x1c:x2c]
+
+                # Safe face detection
+                try:
+                    faces = face_app.get(person_crop)
+                except Exception as e:
+                    print("[WARN] face_app.get error:", e)
+                    faces = []
+
+                if len(faces) > 0:
+                    face = faces[0]
+                    emb = face.embedding
+                    name = match_face(emb)
+                    fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                    fx1 = np.clip(fx1, 0, person_crop.shape[1]-1)
+                    fy1 = np.clip(fy1, 0, person_crop.shape[0]-1)
+                    fx2 = np.clip(fx2, 0, person_crop.shape[1]-1)
+                    fy2 = np.clip(fy2, 0, person_crop.shape[0]-1)
+                    face_area = max(0, (fx2 - fx1) * (fy2 - fy1))
+                else:
+                    name = "Unknown"
+                    face_area = 0
+
+                face_names_all.append(name)
+                face_areas_all.append(face_area)
+                cv2.putText(annotated, name, (x1c, max(0, y1c-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0,255,0) if name!="Unknown" else (0,128,255), 2)
+
+            # Choose nearest known person by largest face area
+            chosen_idx = None
+            max_face_area = 0
+            for i, name in enumerate(face_names_all):
+                if name != "Unknown" and face_areas_all[i] > max_face_area:
+                    chosen_idx = i
+                    max_face_area = face_areas_all[i]
+
+            # SAFE-DETECT: giữ người đã chọn trong vài frame nếu mất mặt
+            if chosen_idx is None:
+                if chosen_idx_last is not None:
+                    frames_no_face += 1
+                    if frames_no_face <= chosen_hold_frames:
+                        chosen_idx = chosen_idx_last
+                    else:
+                        chosen_idx_last = None
+            else:
+                frames_no_face = 0
+
+            if chosen_idx is not None:
+                chosen_idx_last = chosen_idx
+
+            # Safe keypoints access
+            if keypoints_all is None or chosen_idx is None or chosen_idx >= len(keypoints_all):
+                person_kps = np.zeros((17, 2))  # Default keypoints, x,y = 0
+            else:
+                person_kps = keypoints_all[chosen_idx]
+
+            # Process hands and commands
+            if chosen_idx is not None:
+                x1, y1, x2, y2 = pose_bboxes[chosen_idx]
+                x1 = max(0, min(w_img-1, int(x1)))
+                y1 = max(0, min(h_img-1, int(y1)))
+                x2 = max(0, min(w_img-1, int(x2)))
+                y2 = max(0, min(h_img-1, int(y2)))
+
+                hand_detected, left_hand_cmd, right_hand_cmd, left_count, right_count = process_hand(frame, x1, y1, x2, y2, annotated)
+
+                l_arm_cmd, r_arm_cmd, angles = get_arm_cmd(person_kps)
+                hand_cmd = left_hand_cmd if left_hand_cmd != "" else right_hand_cmd
+                arm_cmd = r_arm_cmd if r_arm_cmd != "" else l_arm_cmd
+                new_detected_cmd = hand_cmd if hand_detected else arm_cmd
+
+                if new_detected_cmd != current_detected_cmd:
+                    current_detected_cmd = new_detected_cmd
+                    final_cmd_timer = time.time() if new_detected_cmd != "" else None
+
+                if final_cmd_timer is not None:
+                    elapsed = time.time() - final_cmd_timer
+                    if elapsed >= confirm_duration:
+                        final_cmd = current_detected_cmd
+                else:
+                    elapsed = 0
+
+                y_offset = 25
+                if left_count != -1:
+                    cv2.putText(annotated, f"L Hand: {left_count} Stop {left_hand_cmd}", (x1+5, y1+y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    y_offset += 25
+                if right_count != -1:
+                    cv2.putText(annotated, f"R Hand: {right_count} {right_hand_cmd}", (x1+5, y1+y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    y_offset += 25
+                if l_arm_cmd != "":
+                    cv2.putText(annotated, f"R Arm: {l_arm_cmd}", (x1+5, y1+y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    y_offset += 25
+                if r_arm_cmd != "":
+                    cv2.putText(annotated, f"L Arm: {r_arm_cmd}", (x1+5, y1+y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    y_offset += 25
+
+                cv2.putText(annotated, f"FINAL CMD: {final_cmd}", (50,50), cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+                if final_cmd_timer is not None and new_detected_cmd != "":
+                    remaining = max(0, confirm_duration - elapsed)
+                    cv2.putText(annotated, f"Confirming: {remaining:.1f}s", (50,90), cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,255),2)
+            else:
+                cv2.putText(annotated, f"FINAL CMD: {final_cmd}", (50,50), cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+
+            cv2.imshow("Robot mapping", annotated)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                running = False
+                cv2.destroyAllWindows()
+                break
+
+        except Exception as e:
+            print("[ERROR] processing_thread exception:", e)
+            time.sleep(0.05)
+
+threading.Thread(target=processing_thread, daemon=True).start()
+
+# ========================== 9. Keep main alive / cleanup ==========================
+try:
+    while running:
+        time.sleep(0.1)
+except KeyboardInterrupt:
+    running = False
+finally:
+    running = False
+    time.sleep(0.2)
+    try:
+        if cap.isOpened():
+            cap.release()
+    except Exception as e:
+        print("cap.release() error:", e)
+    cv2.destroyAllWindows()
